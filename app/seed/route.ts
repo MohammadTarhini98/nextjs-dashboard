@@ -4,9 +4,10 @@ import { invoices, customers, revenue, users } from '../lib/placeholder-data';
 
 const sql = postgres(process.env.POSTGRES_URL!, { ssl: 'require' });
 
-async function seedUsers() {
-  await sql`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`;
-  await sql`
+type Tx = postgres.TransactionSql;
+
+async function seedUsers(tx: Tx) {
+  await tx`
     CREATE TABLE IF NOT EXISTS users (
       id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
       name VARCHAR(255) NOT NULL,
@@ -18,7 +19,7 @@ async function seedUsers() {
   const insertedUsers = await Promise.all(
     users.map(async (user) => {
       const hashedPassword = await bcrypt.hash(user.password, 10);
-      return sql`
+      return tx`
         INSERT INTO users (id, name, email, password)
         VALUES (${user.id}, ${user.name}, ${user.email}, ${hashedPassword})
         ON CONFLICT (id) DO NOTHING;
@@ -29,10 +30,8 @@ async function seedUsers() {
   return insertedUsers;
 }
 
-async function seedInvoices() {
-  await sql`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`;
-
-  await sql`
+async function seedInvoices(tx: Tx) {
+  await tx`
     CREATE TABLE IF NOT EXISTS invoices (
       id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
       customer_id UUID NOT NULL,
@@ -42,9 +41,17 @@ async function seedInvoices() {
     );
   `;
 
+  // Placeholder invoices have no fixed id, so ON CONFLICT (id) can never
+  // match. Skip the insert when the table is already populated so that
+  // re-running the seed does not create duplicates.
+  const [{ count }] = await tx<{ count: number }[]>`
+    SELECT COUNT(*)::int AS count FROM invoices
+  `;
+  if (count > 0) return [];
+
   const insertedInvoices = await Promise.all(
     invoices.map(
-      (invoice) => sql`
+      (invoice) => tx`
         INSERT INTO invoices (customer_id, amount, status, date)
         VALUES (${invoice.customer_id}, ${invoice.amount}, ${invoice.status}, ${invoice.date})
         ON CONFLICT (id) DO NOTHING;
@@ -55,10 +62,8 @@ async function seedInvoices() {
   return insertedInvoices;
 }
 
-async function seedCustomers() {
-  await sql`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`;
-
-  await sql`
+async function seedCustomers(tx: Tx) {
+  await tx`
     CREATE TABLE IF NOT EXISTS customers (
       id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
       name VARCHAR(255) NOT NULL,
@@ -69,7 +74,7 @@ async function seedCustomers() {
 
   const insertedCustomers = await Promise.all(
     customers.map(
-      (customer) => sql`
+      (customer) => tx`
         INSERT INTO customers (id, name, email, image_url)
         VALUES (${customer.id}, ${customer.name}, ${customer.email}, ${customer.image_url})
         ON CONFLICT (id) DO NOTHING;
@@ -80,8 +85,8 @@ async function seedCustomers() {
   return insertedCustomers;
 }
 
-async function seedRevenue() {
-  await sql`
+async function seedRevenue(tx: Tx) {
+  await tx`
     CREATE TABLE IF NOT EXISTS revenue (
       month VARCHAR(4) NOT NULL UNIQUE,
       revenue INT NOT NULL
@@ -90,7 +95,7 @@ async function seedRevenue() {
 
   const insertedRevenue = await Promise.all(
     revenue.map(
-      (rev) => sql`
+      (rev) => tx`
         INSERT INTO revenue (month, revenue)
         VALUES (${rev.month}, ${rev.revenue})
         ON CONFLICT (month) DO NOTHING;
@@ -103,12 +108,17 @@ async function seedRevenue() {
 
 export async function GET() {
   try {
-    const result = await sql.begin((sql) => [
-      seedUsers(),
-      seedCustomers(),
-      seedInvoices(),
-      seedRevenue(),
-    ]);
+    // Run every step on the transaction connection, one after another, so a
+    // failure rolls back the whole seed. The extension is created once up
+    // front: concurrent CREATE EXTENSION IF NOT EXISTS calls race and fail
+    // with a unique violation (23505) on pg_extension.
+    await sql.begin(async (tx) => {
+      await tx`CREATE EXTENSION IF NOT EXISTS "uuid-ossp"`;
+      await seedUsers(tx);
+      await seedCustomers(tx);
+      await seedInvoices(tx);
+      await seedRevenue(tx);
+    });
 
     return Response.json({ message: 'Database seeded successfully' });
   } catch (error) {
